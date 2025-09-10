@@ -7,11 +7,42 @@ import path from "node:path";
 import OpenAI from "openai";
 
 /* ===========================
+   Basic per-IP rate limit
+=========================== */
+
+type Bucket = { count: number; resetAt: number };
+type RateLimitResult = { ok: boolean; remaining: number; resetAt: number };
+
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60); // default 60 req/min
+const buckets = new Map<string, Bucket>();
+
+function getClientIp(req: NextRequest): string {
+  const xf = req.headers.get("x-forwarded-for") || "";
+  const ip = xf.split(",")[0]?.trim() || req.headers.get("x-real-ip") || "unknown";
+  return ip;
+}
+
+function checkRateLimit(ip: string): RateLimitResult {
+  const now = Date.now();
+  const b = buckets.get(ip);
+  if (!b || now >= b.resetAt) {
+    const resetAt = now + RATE_LIMIT_WINDOW_MS;
+    buckets.set(ip, { count: 1, resetAt });
+    return { ok: true, remaining: RATE_LIMIT_MAX - 1, resetAt };
+  }
+  if (b.count >= RATE_LIMIT_MAX) {
+    return { ok: false, remaining: 0, resetAt: b.resetAt };
+  }
+  b.count += 1;
+  return { ok: true, remaining: RATE_LIMIT_MAX - b.count, resetAt: b.resetAt };
+}
+
+/* ===========================
    Types (no `any`)
 =========================== */
 
 type Doc = { filename: string; text: string };
-
 type Hit = { filename: string; snippet: string };
 
 // Minimal shape returned by vectorStores.search(...)
@@ -23,13 +54,17 @@ type VSResult = {
 
 // Minimal shape returned by vectorStores.files.list(...).data[i]
 type VSFileItem = {
-  id: string; // vector-store file record id
+  id: string;       // vector-store file record id
   file_id?: string; // actual file id to use with files.* endpoints
 };
+
+// Minimal shape for Responses API readback we use
+type ResponsesTextOnly = { output_text?: string };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 const STORE_ID = process.env.OPENAI_VECTOR_STORE_ID || "";
 const KB_MODE = (process.env.KB_MODE || "local").toLowerCase(); // "local" | "openai"
+const DEBUG = process.env.DEBUG_LOGS === "1";
 
 /* ===========================
    Helpers
@@ -109,11 +144,72 @@ function findMatches(q: string, docs: Doc[]): Hit[] {
   return hits;
 }
 
+/**
+ * Compose a concise Spanish answer from retrieved snippets.
+ * Falls back to the default “no info” sentence if the model returns empty.
+ */
+async function composeAnswer(question: string, snippets: Hit[]): Promise<string> {
+  const snippetText = snippets.map((h) => `• ${h.filename}: “${h.snippet}”`).join("\n");
+
+  const resp = await client.responses.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    input: [
+      {
+        role: "system",
+        content: [
+          {
+            type: "input_text",
+            text:
+              "Eres un asistente legal en español. Responde de forma breve y clara " +
+              "usando EXCLUSIVAMENTE los fragmentos proporcionados. Si no hay evidencia suficiente, " +
+              'responde exactamente: "No hay información suficiente en la base."',
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              `Pregunta: ${question}\n\n` +
+              `Fragmentos recuperados (usa solo estos, sin inventar):\n${snippetText}\n\n` +
+              "Devuelve solo el texto final de la respuesta.",
+          },
+        ],
+      },
+    ],
+  });
+
+  const out = (resp as unknown as ResponsesTextOnly).output_text?.trim() ?? "";
+  return out.length > 0 ? out : "No hay información suficiente en la base.";
+}
+
 /* ===========================
    Route Handler
 =========================== */
 
 export async function POST(req: NextRequest) {
+  // ---- Rate limit check (before any heavy work) ----
+  const ip = getClientIp(req);
+  const rl = checkRateLimit(ip);
+  if (!rl.ok) {
+    return new Response(
+      JSON.stringify({ error: true, message: "Rate limit exceeded. Try again soon." }),
+      {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "x-ratelimit-remaining": String(rl.remaining),
+          "x-ratelimit-reset": String(rl.resetAt),
+        },
+      }
+    );
+  }
+
+  const t0 = Date.now();
+
   try {
     // Parse body strictly without `any`
     const body = (await req.json()) as unknown;
@@ -137,7 +233,7 @@ export async function POST(req: NextRequest) {
 
       let results: VSResult[] = [];
       try {
-        // Return type is not fully typed by SDK → treat as unknown then narrow
+        // SDK returns { data: VSResult[] }
         const resUnknown = await client.vectorStores.search(STORE_ID, { query: q });
         const narrowed = (resUnknown as unknown) as { data?: VSResult[] };
         results = Array.isArray(narrowed?.data) ? narrowed.data : [];
@@ -192,16 +288,53 @@ export async function POST(req: NextRequest) {
       return Response.json({ answer: "No hay información suficiente en la base.", citations: [] });
     }
 
-    const top = hits.slice(0, 3);
+    // --- De-duplicate citations by filename (keep first / most relevant)
+    const uniqueByFile = new Map<string, Hit>();
+    for (const h of hits) {
+      if (!uniqueByFile.has(h.filename)) uniqueByFile.set(h.filename, h);
+    }
+    const top = Array.from(uniqueByFile.values()).slice(0, 3);
     const citations = top.map((h) => h.filename);
-    const answer = `Se encontró la información en: ${citations.join(
-      ", ",
-    )}. Ejemplo: ${top[0].snippet.slice(0, 220)}…`;
 
-    return Response.json({ answer, citations });
+    // Let the model compose a concise answer from the retrieved snippets
+    let answer: string;
+    try {
+      answer = await composeAnswer(q, top);
+    } catch {
+      // Safe fallback if the model call fails
+      answer = `Se encontró la información en: ${citations.join(
+        ", ",
+      )}. Ejemplo: ${top[0].snippet.slice(0, 220)}…`;
+    }
+
+    // Include evidence snippets in the response
+    const evidence = top.map(({ filename, snippet }) => ({ filename, snippet }));
+
+    const runtimeMs = Date.now() - t0;
+    if (DEBUG) {
+      console.log(
+        JSON.stringify({
+          event: "chat_reply",
+          mode: KB_MODE,
+          q,
+          citations,
+          runtime_ms: runtimeMs,
+        })
+      );
+    }
+
+    return Response.json(
+      { answer, citations, evidence },
+      {
+        headers: {
+          "x-ratelimit-remaining": String(rl.remaining),
+          "x-ratelimit-reset": String(rl.resetAt),
+          "x-runtime-ms": String(runtimeMs),
+        },
+      }
+    );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Log a compact error line; avoids eslint unused vars
     console.error("API error:", msg);
     return Response.json({ error: true, message: msg }, { status: 500 });
   }
