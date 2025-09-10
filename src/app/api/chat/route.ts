@@ -63,7 +63,11 @@ type ResponsesTextOnly = { output_text?: string };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 const STORE_ID = process.env.OPENAI_VECTOR_STORE_ID || "";
-const KB_MODE = (process.env.KB_MODE || "local").toLowerCase(); // "local" | "openai"
+// Use env override if present; otherwise OpenAI in prod, Local elsewhere
+const KB_MODE = (
+  process.env.KB_MODE ||
+  (process.env.VERCEL_ENV === "production" ? "openai" : "local")
+).toLowerCase(); // "local" | "openai"
 const DEBUG = process.env.DEBUG_LOGS === "1";
 
 /* ===========================
