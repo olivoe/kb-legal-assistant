@@ -1,55 +1,79 @@
 "use client";
+
 import { useState } from "react";
 
-type Msg = { role: "user" | "assistant"; content: string };
+type ChatReply = {
+  answer: string;
+  citations?: string[];
+  error?: boolean;
+  message?: string;
+};
 
 export default function Home() {
-  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState<ChatReply[]>([]);
 
   async function send() {
-    if (!input.trim()) return;
-    const userMsg: Msg = { role: "user", content: input };
-    setMessages((m) => [...m, userMsg]);
+    const msg = input.trim();
+    if (!msg || loading) return;
+    setLoading(true);
     setInput("");
 
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMsg.content }),
-    });
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+      });
 
-    const data = await res.json();
-    setMessages((m) => [...m, { role: "assistant", content: data.answer }]);
+      const data: ChatReply = await res.json();
+      setHistory((h) => [{ answer: data.answer, citations: data.citations || [] }, ...h]);
+    } catch {
+      setHistory((h) => [{ answer: "Backend request failed.", citations: [] }, ...h]);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
-    <main style={{ padding: 24, maxWidth: 800, margin: "0 auto" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 12 }}>
-        Asistente Legal (KB-first)
-      </h1>
+    <main className="min-h-screen max-w-3xl mx-auto p-6">
+      <h1 className="text-2xl font-semibold mb-4">KB-first Legal Assistant (ES)</h1>
 
-      <ul style={{ listStyle: "none", padding: 0, marginBottom: 16 }}>
-        {messages.map((m, i) => (
-          <li key={i} style={{ marginBottom: 8 }}>
-            <strong>{m.role === "user" ? "Tú" : "Asistente"}:</strong>{" "}
-            {m.content}
+      <div className="flex gap-2 mb-4">
+        <input
+          className="flex-1 border rounded px-3 py-2"
+          placeholder="Type your question…"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => (e.key === "Enter" ? send() : undefined)}
+          disabled={loading}
+        />
+        <button className="border rounded px-4 py-2" onClick={send} disabled={loading}>
+          {loading ? "Sending…" : "Send"}
+        </button>
+      </div>
+
+      <ul className="space-y-4">
+        {history.map((r, idx) => (
+          <li key={idx} className="border rounded p-4">
+            <p className="whitespace-pre-wrap">{r.answer}</p>
+            {!!(r.citations && r.citations.length) && (
+              <div className="mt-3 text-sm">
+                <span className="font-medium">Citations:</span>{" "}
+                {r.citations.map((c, i) => (
+                  <span
+                    key={`${c}-${i}`}
+                    className="inline-block bg-gray-100 border rounded px-2 py-0.5 mr-2 mt-2"
+                  >
+                    {c}
+                  </span>
+                ))}
+              </div>
+            )}
           </li>
         ))}
       </ul>
-
-      <div style={{ display: "flex", gap: 8 }}>
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => (e.key === "Enter" ? send() : null)}
-          placeholder="Escribe tu pregunta…"
-          style={{ flex: 1, border: "1px solid #ccc", borderRadius: 6, padding: "8px 10px" }}
-        />
-        <button onClick={send} style={{ border: "1px solid #ccc", borderRadius: 6, padding: "8px 14px" }}>
-          Enviar
-        </button>
-      </div>
     </main>
   );
 }
