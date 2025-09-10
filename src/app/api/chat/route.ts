@@ -63,11 +63,13 @@ type ResponsesTextOnly = { output_text?: string };
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 const STORE_ID = process.env.OPENAI_VECTOR_STORE_ID || "";
+
 // Use env override if present; otherwise OpenAI in prod, Local elsewhere
 const KB_MODE = (
   process.env.KB_MODE ||
   (process.env.VERCEL_ENV === "production" ? "openai" : "local")
 ).toLowerCase(); // "local" | "openai"
+
 const DEBUG = process.env.DEBUG_LOGS === "1";
 
 /* ===========================
@@ -146,6 +148,51 @@ function findMatches(q: string, docs: Doc[]): Hit[] {
   }
 
   return hits;
+}
+
+/* ----- Display name mapping (labels + prettifier) ----- */
+
+let LABELS_CACHE: Record<string, string> | null = null;
+
+async function loadLabels(): Promise<Record<string, string>> {
+  if (LABELS_CACHE) return LABELS_CACHE;
+  try {
+    // Optional file: kb/labels.json
+    const p = path.resolve("kb", "labels.json");
+    const txt = await fs.readFile(p, "utf8");
+    LABELS_CACHE = JSON.parse(txt) as Record<string, string>;
+  } catch {
+    LABELS_CACHE = {};
+  }
+  return LABELS_CACHE!;
+}
+
+function baseNameNoExt(filename: string): string {
+  const base = path.basename(filename);
+  const i = base.lastIndexOf(".");
+  return i > 0 ? base.slice(0, i) : base;
+}
+
+function titleCase(s: string): string {
+  return s
+    .split(/\s+/)
+    .map((w) => (w ? w[0]!.toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+function prettifyName(filename: string): string {
+  const base = baseNameNoExt(filename)
+    .replace(/[_\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return titleCase(base || filename);
+}
+
+async function displayNameFor(filename: string): Promise<string> {
+  const labels = await loadLabels();
+  const base = baseNameNoExt(filename);
+  // Prefer exact filename match, then base name, else prettify
+  return labels[filename] || labels[base] || prettifyName(filename);
 }
 
 /**
@@ -298,21 +345,28 @@ export async function POST(req: NextRequest) {
       if (!uniqueByFile.has(h.filename)) uniqueByFile.set(h.filename, h);
     }
     const top = Array.from(uniqueByFile.values()).slice(0, 3);
-    const citations = top.map((h) => h.filename);
+
+    // Prepare display names
+    const citationsRaw = top.map((h) => h.filename);
+    const citations = await Promise.all(citationsRaw.map(displayNameFor));
+    const displaySnippets = await Promise.all(
+      top.map(async (h) => ({ filename: await displayNameFor(h.filename), snippet: h.snippet }))
+    );
 
     // Let the model compose a concise answer from the retrieved snippets
     let answer: string;
     try {
-      answer = await composeAnswer(q, top);
+      // Note: we pass display names into the composition for a cleaner answer
+      answer = await composeAnswer(q, displaySnippets);
     } catch {
       // Safe fallback if the model call fails
       answer = `Se encontró la información en: ${citations.join(
         ", ",
-      )}. Ejemplo: ${top[0].snippet.slice(0, 220)}…`;
+      )}. Ejemplo: ${displaySnippets[0].snippet.slice(0, 220)}…`;
     }
 
-    // Include evidence snippets in the response
-    const evidence = top.map(({ filename, snippet }) => ({ filename, snippet }));
+    // Include evidence snippets (with display names) in the response
+    const evidence = displaySnippets;
 
     const runtimeMs = Date.now() - t0;
     if (DEBUG) {
@@ -321,7 +375,8 @@ export async function POST(req: NextRequest) {
           event: "chat_reply",
           mode: KB_MODE,
           q,
-          citations,
+          citations_raw: citationsRaw,
+          citations_display: citations,
           runtime_ms: runtimeMs,
         })
       );
