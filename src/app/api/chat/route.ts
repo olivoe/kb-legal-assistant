@@ -44,6 +44,7 @@ function checkRateLimit(ip: string): RateLimitResult {
 
 type Doc = { filename: string; text: string };
 type Hit = { filename: string; snippet: string };
+type Turn = { role: "user" | "assistant"; content: string };
 
 // Minimal shape returned by vectorStores.search(...)
 type VSResult = {
@@ -54,7 +55,7 @@ type VSResult = {
 
 // Minimal shape returned by vectorStores.files.list(...).data[i]
 type VSFileItem = {
-  id: string;       // vector-store file record id
+  id: string; // vector-store file record id
   file_id?: string; // actual file id to use with files.* endpoints
 };
 
@@ -115,6 +116,7 @@ function findMatches(q: string, docs: Doc[]): Hit[] {
     (w) => w.length >= 5,
   );
 
+  // Extend with Spain immigration domain phrases as needed
   const phrases = [
     "articulo 123 del codigo procesal",
     "articulo 123 codigo procesal",
@@ -195,12 +197,95 @@ async function displayNameFor(filename: string): Promise<string> {
   return labels[filename] || labels[base] || prettifyName(filename);
 }
 
+/* ----- Deterministic fallback helpers (11A-fix) ----- */
+
+function hasStrongEvidence(snips: Hit[]): boolean {
+  const NEEDLES = [
+    "artículo",
+    "articulo",
+    "formulario",
+    "modelo",
+    "plazo",
+    "plazos",
+    "requisito",
+    "requisitos",
+    "notificación",
+    "notificaciones",
+    "procedimiento",
+    "trámite",
+    "tramite",
+    "código",
+    "codigo",
+    "ley",
+  ];
+  return snips.some((h) => {
+    const t = h.snippet.toLowerCase();
+    return t.length > 80 && NEEDLES.some((w) => t.includes(w));
+  });
+}
+
+function deterministicFromSnippets(_q: string, snips: Hit[]): string {
+  // naive sentence splitter
+  const SENT_SPLIT = /(?<=\.|\?|¡|!|;)\s+/g;
+  const KEY = [
+    "artículo",
+    "articulo",
+    "plazo",
+    "plazos",
+    "notificación",
+    "notificaciones",
+    "formulario",
+    "modelo",
+    "requisito",
+    "requisitos",
+    "procedimiento",
+    "trámite",
+    "tramite",
+    "código",
+    "codigo",
+    "ley",
+  ];
+
+  const chosen: string[] = [];
+  for (const s of snips) {
+    const sentences = s.snippet.replace(/\s+/g, " ").trim().split(SENT_SPLIT);
+    const hit =
+      sentences.find((x) => {
+        const lx = x.toLowerCase();
+        return KEY.some((k) => lx.includes(k));
+      }) || sentences[0];
+    if (hit) {
+      chosen.push(hit.trim());
+    }
+    if (chosen.length >= 2) break;
+  }
+
+  const body = chosen.join(" ");
+  // Jurist/formal and explicitly referential
+  return body
+    ? `${body} (respuesta referencial basada en los documentos citados).`
+    : "No hay información suficiente en la base.";
+}
+
+/* ----- Model composition ----- */
+
 /**
  * Compose a concise Spanish answer from retrieved snippets.
+ * Uses conversation history for context.
  * Falls back to the default “no info” sentence if the model returns empty.
  */
-async function composeAnswer(question: string, snippets: Hit[]): Promise<string> {
+async function composeAnswer(
+  question: string,
+  snippets: Hit[],
+  history: Turn[]
+): Promise<string> {
   const snippetText = snippets.map((h) => `• ${h.filename}: “${h.snippet}”`).join("\n");
+
+  // Compact recent history (last 6 turns)
+  const recent = history.slice(-6);
+  const histText = recent
+    .map((t) => (t.role === "user" ? `Usuario: ${t.content}` : `Asistente: ${t.content}`))
+    .join("\n");
 
   const resp = await client.responses.create({
     model: "gpt-4o-mini",
@@ -212,9 +297,11 @@ async function composeAnswer(question: string, snippets: Hit[]): Promise<string>
           {
             type: "input_text",
             text:
-              "Eres un asistente legal en español. Responde de forma breve y clara " +
-              "usando EXCLUSIVAMENTE los fragmentos proporcionados. Si no hay evidencia suficiente, " +
-              'responde exactamente: "No hay información suficiente en la base."',
+              "Eres un asistente legal en español (enfocado en inmigración en España). " +
+              "Estilo jurista y formal, longitud media; usa viñetas y un breve resumen inicial cuando sea útil. " +
+              "Responde EXCLUSIVAMENTE con base en los fragmentos proporcionados. " +
+              "Si la evidencia es insuficiente, responde exactamente: \"No hay información suficiente en la base.\" " +
+              "Deja claro que la respuesta es referencial (no asesoramiento legal).",
           },
         ],
       },
@@ -224,9 +311,10 @@ async function composeAnswer(question: string, snippets: Hit[]): Promise<string>
           {
             type: "input_text",
             text:
-              `Pregunta: ${question}\n\n` +
+              (histText ? `Contexto de conversación:\n${histText}\n\n` : "") +
+              `Pregunta actual: ${question}\n\n` +
               `Fragmentos recuperados (usa solo estos, sin inventar):\n${snippetText}\n\n` +
-              "Devuelve solo el texto final de la respuesta.",
+              "Devuelve únicamente el texto final de la respuesta.",
           },
         ],
       },
@@ -264,6 +352,7 @@ export async function POST(req: NextRequest) {
   try {
     // Parse body strictly without `any`
     const body = (await req.json()) as unknown;
+
     const message =
       typeof body === "object" && body !== null && "message" in (body as Record<string, unknown>)
         ? (body as Record<string, unknown>).message
@@ -273,6 +362,23 @@ export async function POST(req: NextRequest) {
     if (!q) {
       return Response.json({ answer: "No hay información suficiente en la base.", citations: [] });
     }
+
+    // Parse optional history (compact recent turns, role-validated, length trimmed)
+    const history: Turn[] =
+      typeof body === "object" &&
+      body !== null &&
+      "history" in (body as Record<string, unknown>) &&
+      Array.isArray((body as Record<string, unknown>).history)
+        ? ((body as Record<string, unknown>).history as Turn[])
+            .filter(
+              (t) =>
+                t &&
+                (t.role === "user" || t.role === "assistant") &&
+                typeof t.content === "string"
+            )
+            .map((t) => ({ role: t.role, content: t.content.slice(0, 2000) }))
+            .slice(-8)
+        : [];
 
     let docs: Doc[] = [];
 
@@ -353,16 +459,23 @@ export async function POST(req: NextRequest) {
       top.map(async (h) => ({ filename: await displayNameFor(h.filename), snippet: h.snippet }))
     );
 
-    // Let the model compose a concise answer from the retrieved snippets
+    // Let the model compose a concise answer from the retrieved snippets + history
     let answer: string;
     try {
-      // Note: we pass display names into the composition for a cleaner answer
-      answer = await composeAnswer(q, displaySnippets);
+      answer = await composeAnswer(q, displaySnippets, history);
     } catch {
       // Safe fallback if the model call fails
       answer = `Se encontró la información en: ${citations.join(
         ", ",
       )}. Ejemplo: ${displaySnippets[0].snippet.slice(0, 220)}…`;
+    }
+
+    // 11A-fix: if model responded with "No hay..." but we have strong evidence, synthesize deterministically
+    if (answer.trim() === "No hay información suficiente en la base." && hasStrongEvidence(top)) {
+      if (DEBUG) {
+        console.log(JSON.stringify({ event: "deterministic_fallback", q, citations_raw: citationsRaw }));
+      }
+      answer = deterministicFromSnippets(q, top);
     }
 
     // Include evidence snippets (with display names) in the response
@@ -378,6 +491,7 @@ export async function POST(req: NextRequest) {
           citations_raw: citationsRaw,
           citations_display: citations,
           runtime_ms: runtimeMs,
+          history_turns: history.length,
         })
       );
     }
