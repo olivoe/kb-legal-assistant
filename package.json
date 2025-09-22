@@ -1,27 +1,41 @@
 {
+  "type": "module",
   "name": "kb-legal-assistant",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build --turbopack",
+    "dev": "next dev",
+    "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "next lint",
+    "kb:build": "node scripts/build_kb_index.mjs",
+    "kb:build:tsx": "tsx scripts/build-kb.ts"
   },
   "dependencies": {
+    "@upstash/redis": "^1.35.3",
     "dotenv": "^17.2.2",
+    "eventsource": "^4.0.0",
+    "he": "^1.2.0",
+    "mammoth": "^1.10.0",
     "next": "15.5.2",
+    "node-fetch": "^3.3.2",
     "openai": "^5.20.0",
+    "pdfjs-dist": "^4.10.38",
+    "pdfkit": "^0.17.2",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@types/node": "^20",
+    "@types/pdf-parse": "^1.1.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "15.5.2",
+    "tsx": "^4.20.5",
     "typescript": "^5"
   }
 }

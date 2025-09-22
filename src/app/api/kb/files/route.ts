@@ -1,133 +1,158 @@
-export const runtime = "nodejs";
-
-import { NextRequest } from "next/server";
-import fs from "node:fs/promises";
+// src/app/api/kb/files/route.ts
+import { NextResponse } from "next/server";
+import fs from "node:fs";
 import path from "node:path";
 import OpenAI from "openai";
 
 type FileRow = {
   filename: string;
-  sizeBytes?: number | null;
-  modifiedAt?: string | null;
-  file_id?: string | null; // for OpenAI store
-  preview?: string | null; // optional
+  sizeBytes: number;
+  modifiedAt: string | null;
+  file_id: string | null;
+  preview: string | null;
 };
 
-const KB_MODE = (
-  process.env.KB_MODE ||
-  (process.env.VERCEL_ENV === "production" ? "openai" : "local")
-).toLowerCase(); // "local" | "openai"
+/** Extract simple text preview from PDFs using pdfjs-dist (Node/SSR friendly) */
+async function extractPdfText(buf: Uint8Array): Promise<string> {
+  const pdfjsLib: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
 
-const STORE_ID = process.env.OPENAI_VECTOR_STORE_ID || "";
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
+  // In Node we don’t need a worker
+  if (pdfjsLib.GlobalWorkerOptions) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = undefined as any;
+  }
 
-async function listLocal(previewChars: number): Promise<FileRow[]> {
-  const dir = path.resolve("kb");
-  let names: string[] = [];
+  const loadingTask = pdfjsLib.getDocument({ data: buf });
+  const pdf = await loadingTask.promise;
+
+  let text = "";
+  const maxPages = Math.min(pdf.numPages, 30); // safety cap
+  for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    const pageText = content.items.map((it: any) => it.str ?? "").join(" ");
+    text += pageText + "\n";
+  }
+
   try {
-    names = await fs.readdir(dir);
+    if (typeof pdf.cleanup === "function") await pdf.cleanup();
   } catch {
+    /* noop */
+  }
+
+  return text.trim();
+}
+
+function isSupportedExt(fileName: string): boolean {
+  const ext = path.extname(fileName).toLowerCase();
+  return [".txt", ".md", ".markdown", ".pdf", ".html", ".htm"].includes(ext);
+}
+
+/** List files from the local KB directory and build short previews */
+async function listLocal(): Promise<FileRow[]> {
+  const kbDir = process.env.KB_LOCAL_DIR || "data/kb";
+  const root = path.join(process.cwd(), kbDir);
+
+  let entries: fs.Dirent[] = [];
+  try {
+    entries = await fs.promises.readdir(root, { withFileTypes: true });
+  } catch {
+    // directory may not exist yet
     return [];
   }
 
-  const filtered = names.filter((n) => /\.(txt|md)$/i.test(n));
-  const out: FileRow[] = [];
+  const rows: FileRow[] = [];
+  for (const ent of entries) {
+    if (!ent.isFile()) continue;
+    if (!isSupportedExt(ent.name)) continue;
 
-  for (const name of filtered) {
-    const p = path.join(dir, name);
+    const full = path.join(root, ent.name);
+
+    let size = 0;
+    let modifiedAt: string | null = null;
     try {
-      const st = await fs.stat(p);
-      let preview: string | null = null;
-      if (previewChars > 0 && st.size > 0) {
-        // Read only up to previewChars
-        const text = await fs.readFile(p, "utf8");
-        preview = text.slice(0, previewChars);
-      }
-      out.push({
-        filename: name,
-        sizeBytes: st.size,
-        modifiedAt: st.mtime.toISOString(),
-        file_id: null,
-        preview,
-      });
+      const stat = await fs.promises.stat(full);
+      size = stat.size;
+      modifiedAt = stat.mtime.toISOString();
     } catch {
-      // skip unreadable
+      // ignore stat errors, still show filename
     }
+
+    let preview: string | null = null;
+    try {
+      const buf = await fs.promises.readFile(full);
+      const ext = path.extname(ent.name).toLowerCase();
+      if (ext === ".pdf") {
+        const text = await extractPdfText(new Uint8Array(buf));
+        preview = text.slice(0, 200) || null;
+      } else {
+        const text = buf.toString("utf8");
+        preview = text.slice(0, 200);
+      }
+    } catch {
+      // ignore preview errors
+    }
+
+    rows.push({
+      filename: ent.name,
+      sizeBytes: size,
+      modifiedAt,
+      file_id: null,
+      preview,
+    });
   }
-  return out;
+
+  return rows;
 }
 
-async function listOpenAI(previewChars: number): Promise<FileRow[]> {
-  if (!STORE_ID || !process.env.OPENAI_API_KEY) return [];
+/** List files from an OpenAI vector store (metadata only; no preview here) */
+async function listOpenAI(): Promise<FileRow[]> {
+  const apiKey = process.env.OPENAI_API_KEY || "";
+  const storeId = process.env.OPENAI_VECTOR_STORE_ID || "";
+  if (!apiKey || !storeId) return [];
 
-  // List up to 100 files; adjust if you expect more
-  let items: Array<{ id: string; file_id?: string }> = [];
+  const client = new OpenAI({ apiKey });
+
+  // Basic list (avoid unknown params to keep it compatible)
+  const page = await client.vectorStores.files.list(storeId);
+
+  const rows: FileRow[] = [];
+  for (const f of page.data) {
+    rows.push({
+      filename: (f as any).filename ?? (f as any).id, // some SDK versions expose filename
+      sizeBytes: (f as any).bytes ?? 0,
+      modifiedAt:
+        (f as any).created_at != null
+          ? new Date((f as any).created_at * 1000).toISOString()
+          : null,
+      file_id: (f as any).id ?? null,
+      preview: null, // previews not returned by API
+    });
+  }
+  return rows;
+}
+
+/** GET /api/kb/files */
+export async function GET() {
+  const mode = (process.env.KB_MODE || "local").toLowerCase();
+
   try {
-    const listed = (await client.vectorStores.files.list(STORE_ID, { limit: 100 })) as unknown as {
-      data?: Array<{ id: string; file_id?: string }>;
-    };
-    items = listed.data ?? [];
-  } catch {
-    items = [];
+    const files =
+      mode === "openai" ? await listOpenAI() : await listLocal();
+
+    return NextResponse.json({
+      mode,
+      count: files.length,
+      files,
+    });
+  } catch (err) {
+    return NextResponse.json(
+      {
+        mode,
+        error: true,
+        message:
+          err instanceof Error ? err.message : "Unexpected error listing KB files",
+      },
+      { status: 500 }
+    );
   }
-
-  const out: FileRow[] = [];
-  for (const it of items) {
-    const fileId = it.file_id ?? it.id;
-    try {
-      // Get filename, size
-      const meta = (await client.files.retrieve(fileId)) as unknown as {
-        filename?: string;
-        bytes?: number;
-      };
-      const filename = meta.filename ?? fileId;
-      const sizeBytes = typeof meta.bytes === "number" ? meta.bytes : null;
-
-      // Optional preview (may be large; read cautiously)
-      let preview: string | null = null;
-      if (previewChars > 0) {
-        try {
-          const contentResp = await client.files.content(fileId);
-          const txt = await contentResp.text();
-          preview = txt.slice(0, previewChars);
-        } catch {
-          preview = null; // could be binary
-        }
-      }
-
-      out.push({
-        filename,
-        sizeBytes,
-        modifiedAt: null,
-        file_id: fileId,
-        preview,
-      });
-    } catch {
-      // skip unreadable/binary
-    }
-  }
-  return out;
-}
-
-export async function GET(req: NextRequest) {
-  const url = new URL(req.url);
-  // ?preview=300 -> include first 300 chars; default 0 (no preview)
-  const previewParam = url.searchParams.get("preview");
-  const preview = Math.max(0, Math.min(2000, Number(previewParam || 0) || 0));
-
-  const effectiveMode = KB_MODE; // already env-driven
-
-  let rows: FileRow[] = [];
-  if (effectiveMode === "openai") {
-    rows = await listOpenAI(preview);
-  } else {
-    rows = await listLocal(preview);
-  }
-
-  // Also include a simple count and mode so you can sanity-check quickly
-  return Response.json({
-    mode: effectiveMode,
-    count: rows.length,
-    files: rows,
-  });
 }

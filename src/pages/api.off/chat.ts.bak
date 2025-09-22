@@ -1,0 +1,84 @@
+// src/pages/api/chat.ts
+import type { NextApiRequest, NextApiResponse } from "next";
+import { POST as appPost } from "@/app/api/chat/route";
+import { Readable } from "node:stream";
+
+export const config = {
+  api: { bodyParser: false },
+};
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  try {
+    // Only allow POST/GET (GET is handy for quick health checks)
+    if (req.method !== "POST" && req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("Allow", "GET, HEAD, POST");
+      return res.status(405).json({ error: "method_not_allowed" });
+    }
+
+    // Build URL that the App Router route will see
+    const url = new URL(req.url || "/api/chat", `http://${req.headers.host}`);
+
+    // Clone headers, drop hop-by-hop
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (v == null) continue;
+      const key = k.toLowerCase();
+      if (["connection", "transfer-encoding", "content-length"].includes(key)) continue;
+      if (Array.isArray(v)) headers.set(k, v.join(", "));
+      else headers.set(k, String(v));
+    }
+
+    // Safely read body for non-GET/HEAD
+    let body: Buffer | undefined;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req as any) {
+        if (chunk === undefined || chunk === null) continue; // <-- prevents undefined in concat()
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      body = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
+    }
+
+    // Construct a Fetch Request compatible with the App Route
+    const nextReq = new Request(url.toString(), {
+      method: req.method,
+      headers,
+      body: body as any, // Buffer or undefined
+    });
+
+    // Call the App Router handler directly
+    const r = await appPost(nextReq as any);
+
+    // Mirror status & headers (skip content-length; Node will manage it)
+    res.status(r.status);
+    r.headers.forEach((value, key) => {
+      if (key.toLowerCase() === "content-length") return;
+      res.setHeader(key, value);
+    });
+
+    // Stream the body to the client (SSE-safe)
+    if (r.body) {
+      // Convert WHATWG ReadableStream -> Node Readable
+      // @ts-ignore - Response.body is a web ReadableStream in the App Router
+      const nodeStream: Readable =
+        typeof r.body.getReader === "function"
+          ? Readable.fromWeb(r.body as any)
+          : (r.body as any);
+
+      nodeStream.on("error", () => {
+        try { res.flushHeaders?.(); } catch {}
+        if (!res.headersSent) res.status(500);
+        try { res.end(); } catch {}
+      });
+
+      nodeStream.pipe(res);
+      return; // piping handles lifecycle
+    }
+
+    // No body -> send whatever we can read
+    const ab = await r.arrayBuffer();
+    res.end(Buffer.from(ab));
+  } catch (e: any) {
+    res.status(500).json({ error: "proxy_failed", message: e?.message || String(e) });
+  }
+}
