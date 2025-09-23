@@ -1,9 +1,7 @@
 // app/layout.tsx
-import type { Metadata } from "next";
-
-export const metadata: Metadata = {
+export const metadata = {
   title: "KB Legal Assistant",
-  description: "RAG + Chat API/GUI",
+  description: "RAG + SSE demo",
 };
 
 export default function RootLayout({
@@ -13,9 +11,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="es">
-      <body style={{ margin: 0, fontFamily: "ui-sans-serif, system-ui" }}>
-        {children}
-      </body>
+      <body style={{ margin: 0 }}>{children}</body>
     </html>
   );
 }
