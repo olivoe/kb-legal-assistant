@@ -1,11 +1,24 @@
 // Health check
-export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+// ✅ bundle embeddings at build-time (works on Vercel)
+import emb from "../../../data/kb/embeddings.json";
+
+type EmbedsFile = {
+  model: string;
+  dims: number;
+  items: Array<{ id: string; file: string; start: number; end: number; embedding: number[] }>;
+};
+const embeddings = emb as EmbedsFile;
 
 export async function GET() {
-  return new Response('chat route alive', {
+  return new Response("chat route alive", {
     status: 200,
-    headers: { 'Content-Type': 'text/plain' },
+    headers: {
+      "Content-Type": "text/plain",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
 
@@ -14,7 +27,7 @@ export async function POST(req: Request) {
   const url = new URL(req.url);
   const limit = Math.max(1, Math.min(10, Number(url.searchParams.get("limit") || 3)));
   const debug = url.searchParams.get("debug") === "1";
-  const MIN_SCORE = 0.72; // tune 0.68–0.78 as you like
+  const MIN_SCORE = 0.65; // tune 0.68–0.78 as you like
 
   let body: any = {};
   try { body = await req.json(); } catch {}
@@ -28,31 +41,47 @@ export async function POST(req: Request) {
   const norm = (s: string) => deaccent(s).toLowerCase();
 
   // helper to read KB file text (txt/md/html/pdf)
-  async function readKbFileText(fname: string) {
-    const { promises: fs } = await import("node:fs");
-    const path = (await import("node:path")).default;
-    const fpath = path.join(process.cwd(), "kb", fname);
-    const ext = path.extname(fname).toLowerCase();
+async function readKbFileText(fname: string) {
+  const { promises: fs } = await import("node:fs");
+  const path = (await import("node:path")).default;
 
-    if (ext === ".pdf") {
-      const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
-      pdfjs.GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
-      (pdfjs as any).GlobalWorkerOptions.standardFontDataUrl = "pdfjs-dist/legacy/build/";
-      const data = new Uint8Array(await fs.readFile(fpath));
-      const doc = await pdfjs.getDocument({ data }).promise;
-      let out = "";
-      for (let pageNo = 1; pageNo <= doc.numPages; pageNo++) {
-        const page = await doc.getPage(pageNo);
-        const content = await page.getTextContent();
-        out += content.items.map((it: any) => it.str).join(" ") + "\n";
-      }
-      return out;
-    }
-    if ([".txt", ".md", ".html"].includes(ext)) {
-      return await fs.readFile(fpath, "utf8").catch(() => "");
-    }
-    return "";
+  // prefer data/kb, fall back to kb
+  const tryPaths = [
+    path.join(process.cwd(), "data", "kb", fname),
+    path.join(process.cwd(), "kb", fname),
+  ];
+
+  // find the first existing path
+  let fpath = tryPaths[0];
+  try {
+    await fs.access(tryPaths[0]);
+  } catch {
+    fpath = tryPaths[1];
   }
+
+  const ext = path.extname(fname).toLowerCase();
+
+  if (ext === ".pdf") {
+    const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
+    (pdfjs as any).GlobalWorkerOptions.standardFontDataUrl = "pdfjs-dist/legacy/build/";
+    const data = new Uint8Array(await fs.readFile(fpath));
+    const doc = await pdfjs.getDocument({ data }).promise;
+    let out = "";
+    for (let pageNo = 1; pageNo <= doc.numPages; pageNo++) {
+      const page = await doc.getPage(pageNo);
+      const content = await page.getTextContent();
+      out += content.items.map((it: any) => it.str).join(" ") + "\n";
+    }
+    return out;
+  }
+
+  if ([".txt", ".md", ".html"].includes(ext)) {
+    return await fs.readFile(fpath, "utf8").catch(() => "");
+  }
+
+  return "";
+}
 
   // --- tiny embedding helpers (inline to avoid import hassles) ---
   async function embedTexts(texts: string[], model = "text-embedding-3-small"): Promise<number[][]> {
@@ -78,6 +107,7 @@ export async function POST(req: Request) {
   let kb = { indexFound: false, indexCount: 0 };
   let files: string[] = [];
   try {
+    // optional — if missing, code still works
     const { promises: fs } = await import("node:fs");
     const path = (await import("node:path")).default;
     const indexPath = path.join(process.cwd(), "data", "kb", "kb_index.json");
@@ -128,28 +158,25 @@ export async function POST(req: Request) {
         kb,
         limit,
         matches
-      }), { status: 200, headers: { "Content-Type": "application/json" }});
+      }), { status: 200, headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      }});
     }
 
     // ---------- RAG FAST-PATH: top-k chunks via embeddings ----------
     if (q) {
-      const { promises: fs } = await import("node:fs");
-      const path = (await import("node:path")).default;
-      // Import the embeddings so Vercel bundles them with the route
-// (Next has resolveJsonModule enabled by default)
-const emb = (await import("../../../data/kb/embeddings.json")).default as {
-  model: string;
-  dims: number;
-  items: Array<{ id: string; file: string; start: number; end: number; embedding: number[] }>;
-};
+      // use bundled embeddings
       const [qvec] = await embedTexts([q]); // 1536 dims for text-embedding-3-small
-      // score all chunks (could be optimized with ANN later)
-      const scored = emb.items.map(it => ({ ...it, score: cosineSim(qvec, it.embedding) }));
+      const scored = embeddings.items.map(it => ({ ...it, score: cosineSim(qvec, it.embedding) }));
       scored.sort((a, b) => b.score - a.score);
       // keep only relevant chunks
+let topFiltered = scored.filter(s => s.score >= MIN_SCORE).slice(0, limit);
+
+// ✅ fallback: if nothing cleared the threshold, take top-N anyway
+if (topFiltered.length === 0) topFiltered = scored.slice(0, limit);
       const topFiltered = scored.filter(s => s.score >= MIN_SCORE).slice(0, limit);
 
-      // for JSON responses and for building context/snippets
       const top = topFiltered.map(s => ({
         id: s.id, file: s.file, score: Number(s.score.toFixed(5)), start: s.start, end: s.end
       }));
@@ -187,14 +214,29 @@ const emb = (await import("../../../data/kb/embeddings.json")).default as {
           let full = "";
           try { full = await readKbFileText(t.file); } catch {}
           let snippet = "";
-          if (full) {
-            const a = Math.max(0, Math.min(full.length, t.start));
-            const b = Math.max(a, Math.min(full.length, t.end));
-            snippet = full.slice(a, b);
-            if (snippet.length > 1200) snippet = snippet.slice(0, 1200) + "…";
-          } else {
-            snippet = `(chunk ${t.id} ${t.start}-${t.end} from ${t.file})`;
-          }
+if (full) {
+  const a = Math.max(0, Math.min(full.length, t.start));
+  const b = Math.max(a, Math.min(full.length, t.end));
+  snippet = full.slice(a, b);
+  if (snippet.length > 1200) snippet = snippet.slice(0, 1200) + "…";
+} else {
+  // Fallbacks for PDFs: try a sibling .txt with same basename
+  const ext = t.file.split(".").pop()?.toLowerCase();
+  if (ext === "pdf") {
+    const base = t.file.replace(/\.pdf$/i, "");
+    try {
+      const alt = await readKbFileText(`${base}.txt`);
+      if (alt) {
+        const a = Math.max(0, Math.min(alt.length, t.start));
+        const b = Math.max(a, Math.min(alt.length, t.end));
+        snippet = alt.slice(a, b) || alt.slice(0, 800);
+      }
+    } catch {}
+  }
+  if (!snippet) {
+    snippet = `(chunk ${t.id} ${t.start}-${t.end} from ${t.file})`;
+  }
+}
           contextLines.push(`— file: ${t.file}\n— score: ${t.score}\n— snippet: ${snippet}`);
         }
         const ragContext = contextLines.join("\n\n");
@@ -283,7 +325,10 @@ Responde ahora cumpliendo estrictamente el FORMATO DE SALIDA.`
         kb,
         limit,
         topk: top
-      }), { status: 200, headers: { "Content-Type": "application/json" }});
+      }), { status: 200, headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      }});
     }
   } catch {
     // fall through
@@ -300,5 +345,8 @@ Responde ahora cumpliendo estrictamente el FORMATO DE SALIDA.`
     note: debug
       ? "No query or no index; skipping naive scan."
       : "RAG path idle (no query)."
-  }), { status: 200, headers: { "Content-Type": "application/json" }});
+  }), { status: 200, headers: {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  }});
 }
