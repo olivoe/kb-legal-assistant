@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "app/**/*.ts": { "includeFiles": "data/kb/**" },
+    "app/**/*.js": { "includeFiles": "data/kb/**" }
+  }
+}
