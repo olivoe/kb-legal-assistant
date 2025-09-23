@@ -135,16 +135,13 @@ export async function POST(req: Request) {
     if (q) {
       const { promises: fs } = await import("node:fs");
       const path = (await import("node:path")).default;
-      const embPath = path.join(process.cwd(), "data", "kb", "embeddings.json");
-      const rawEmb = await fs.readFile(embPath, "utf8").catch(() => "");
-      if (!rawEmb) {
-        return new Response(JSON.stringify({
-          ok: false, mode: "rag", error: "embeddings-missing"
-        }), { status: 200, headers: { "Content-Type": "application/json" }});
-      }
-      const emb = JSON.parse(rawEmb) as {
-        model: string; dims: number; items: Array<{ id: string; file: string; start: number; end: number; embedding: number[] }>
-      };
+      // Import the embeddings so Vercel bundles them with the route
+// (Next has resolveJsonModule enabled by default)
+const emb = (await import("../../../data/kb/embeddings.json")).default as {
+  model: string;
+  dims: number;
+  items: Array<{ id: string; file: string; start: number; end: number; embedding: number[] }>;
+};
       const [qvec] = await embedTexts([q]); // 1536 dims for text-embedding-3-small
       // score all chunks (could be optimized with ANN later)
       const scored = emb.items.map(it => ({ ...it, score: cosineSim(qvec, it.embedding) }));
