@@ -1,6 +1,10 @@
 {
   "functions": {
-    "app/api/**/route.{ts,js}": {
+    "app/api/**/route.ts": {
+      "includeFiles": "data/kb/**",
+      "runtime": "nodejs20.x"
+    },
+    "app/api/**/route.js": {
       "includeFiles": "data/kb/**",
       "runtime": "nodejs20.x"
     }
