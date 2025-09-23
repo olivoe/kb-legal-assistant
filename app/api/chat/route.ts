@@ -1,5 +1,3 @@
-export const dynamic = 'force-dynamic';
-
 // Health check
 export const dynamic = 'force-dynamic';
 
