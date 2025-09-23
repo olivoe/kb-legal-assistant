@@ -9,7 +9,15 @@
     "start": "next start",
     "lint": "next lint",
     "kb:build": "node scripts/build_kb_index.mjs",
-    "kb:build:tsx": "tsx scripts/build-kb.ts"
+    "kb:build:tsx": "tsx scripts/build-kb.ts",
+    "kb:pdf-check": "node scripts/pdf-check.mjs",
+    "kb:upload": "node scripts/upload-kb.mjs",
+    "kb:sync": "node scripts/sync-kb.mjs",
+    "kb:search": "node scripts/search-store.mjs",
+    "kb:reindex": "npm run kb:build && npm run kb:pdf-check && npm run kb:upload && npm run kb:sync",
+    "kb:store:add": "node scripts/add-to-store.mjs",
+    "kb:store:check": "node scripts/check-store.mjs",
+    "kb:assistants:test": "node scripts/assistants-kb-test.mjs"
   },
   "dependencies": {
     "@upstash/redis": "^1.35.3",
@@ -20,6 +28,7 @@
     "next": "15.5.2",
     "node-fetch": "^3.3.2",
     "openai": "^5.20.0",
+    "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^4.10.38",
     "pdfkit": "^0.17.2",
     "react": "19.1.0",

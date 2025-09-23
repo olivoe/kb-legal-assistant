@@ -1,8 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  experimental: { appDir: true },
-  // Do NOT include: output: "export"
-  // Avoid setting basePath unless you will call /<basePath>/api/...
+  // Keep it boring for dev while we debug chunks.
+  // Do NOT set: basePath, assetPrefix, output, trailingSlash, rewrites, headers, redirects.
 };
-
 export default nextConfig;
