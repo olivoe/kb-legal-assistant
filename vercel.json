@@ -1,9 +1,0 @@
-{
-  "framework": "nextjs"
-}
-{
-  "functions": {
-    "app/**/route.ts": { "includeFiles": "kb/**" },
-    "app/**/route.js": { "includeFiles": "kb/**" }
-  }
-}
