@@ -40,46 +40,36 @@ export async function POST(req: Request) {
   const deaccent = (s: string) => s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
   const norm = (s: string) => deaccent(s).toLowerCase();
 
-  // helper to read KB file text (txt/md/html/pdf)
+ // helper to read KB file text (txt/md/html/pdf) — fail-safe
 async function readKbFileText(fname: string) {
   const { promises: fs } = await import("node:fs");
   const path = (await import("node:path")).default;
-
-  // prefer data/kb, fall back to kb
-  const tryPaths = [
-    path.join(process.cwd(), "data", "kb", fname),
-    path.join(process.cwd(), "kb", fname),
-  ];
-
-  // find the first existing path
-  let fpath = tryPaths[0];
-  try {
-    await fs.access(tryPaths[0]);
-  } catch {
-    fpath = tryPaths[1];
-  }
-
+  const fpath = path.join(process.cwd(), "kb", fname);
   const ext = path.extname(fname).toLowerCase();
 
   if (ext === ".pdf") {
-    const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    pdfjs.GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
-    (pdfjs as any).GlobalWorkerOptions.standardFontDataUrl = "pdfjs-dist/legacy/build/";
-    const data = new Uint8Array(await fs.readFile(fpath));
-    const doc = await pdfjs.getDocument({ data }).promise;
-    let out = "";
-    for (let pageNo = 1; pageNo <= doc.numPages; pageNo++) {
-      const page = await doc.getPage(pageNo);
-      const content = await page.getTextContent();
-      out += content.items.map((it: any) => it.str).join(" ") + "\n";
+    try {
+      const pdfjs: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      pdfjs.GlobalWorkerOptions.workerSrc = "pdfjs-dist/legacy/build/pdf.worker.mjs";
+      (pdfjs as any).GlobalWorkerOptions.standardFontDataUrl = "pdfjs-dist/legacy/build/";
+      const data = new Uint8Array(await fs.readFile(fpath));
+      const doc = await pdfjs.getDocument({ data }).promise;
+      let out = "";
+      for (let pageNo = 1; pageNo <= doc.numPages; pageNo++) {
+        const page = await doc.getPage(pageNo);
+        const content = await page.getTextContent();
+        out += content.items.map((it: any) => it.str).join(" ") + "\n";
+      }
+      return out;
+    } catch {
+      // If pdfjs isn't available in this runtime, don't explode the scan
+      return "";
     }
-    return out;
   }
 
   if ([".txt", ".md", ".html"].includes(ext)) {
     return await fs.readFile(fpath, "utf8").catch(() => "");
   }
-
   return "";
 }
 
@@ -130,11 +120,19 @@ async function readKbFileText(fname: string) {
       for (const fname of files) {
         const path = (await import("node:path")).default;
         const ext = path.extname(fname).toLowerCase();
-        if (![".txt", ".md", ".html", ".pdf"].includes(ext)) continue;
-
-        const text = await readKbFileText(fname);
+      
+        // Debug scan: avoid pdfjs in serverless. We’ll only scan text-like files here.
+        if (![".txt", ".md", ".html"].includes(ext)) continue;
+      
+        let text = "";
+        try {
+          text = await readKbFileText(fname);
+        } catch {
+          // ignore file read errors in debug mode
+          continue;
+        }
         if (!text) continue;
-
+      
         const lower = norm(text);
         let score = 0, idx = 0;
         while ((idx = lower.indexOf(qn, idx)) !== -1) {
@@ -145,6 +143,7 @@ async function readKbFileText(fname: string) {
           matches.push({ file: fname, score, line });
         }
       }
+      
 
       matches.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
       matches = matches.slice(0, limit);
@@ -170,16 +169,21 @@ async function readKbFileText(fname: string) {
       const [qvec] = await embedTexts([q]); // 1536 dims for text-embedding-3-small
       const scored = embeddings.items.map(it => ({ ...it, score: cosineSim(qvec, it.embedding) }));
       scored.sort((a, b) => b.score - a.score);
-      // keep only relevant chunks
-let topFiltered = scored.filter(s => s.score >= MIN_SCORE).slice(0, limit);
+     // keep only relevant chunks
+let topFiltered = scored.filter((s) => s.score >= MIN_SCORE).slice(0, limit);
 
 // ✅ fallback: if nothing cleared the threshold, take top-N anyway
-if (topFiltered.length === 0) topFiltered = scored.slice(0, limit);
-      const topFiltered = scored.filter(s => s.score >= MIN_SCORE).slice(0, limit);
+if (topFiltered.length === 0) {
+  topFiltered = scored.slice(0, limit);
+}
 
-      const top = topFiltered.map(s => ({
-        id: s.id, file: s.file, score: Number(s.score.toFixed(5)), start: s.start, end: s.end
-      }));
+const top = topFiltered.map((s) => ({
+  id: s.id,
+  file: s.file,
+  score: Number(s.score.toFixed(5)),
+  start: s.start,
+  end: s.end,
+}));
 
       // ---------------- STREAM BRANCH ----------------
       const stream = url.searchParams.get("stream") === "1";
