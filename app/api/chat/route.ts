@@ -244,21 +244,27 @@ if (full) {
           contextLines.push(`— file: ${t.file}\n— score: ${t.score}\n— snippet: ${snippet}`);
         }
         const ragContext = contextLines.join("\n\n");
+        const allowedFiles = Array.from(new Set(top.map(t => t.file)));
 
         // System + user messages with strict OUTPUT FORMAT + examples
         const systemMsg = {
           role: "system",
           content:
-`Eres un asistente jurídico. Responde SOLO usando el CONTEXTO.
-Si algo no está explícitamente en el CONTEXTO, di que no consta.
-Estilo: español claro, directo y conciso (máximo 4 oraciones).
-CITAS:
-- Cada oración que use datos del CONTEXTO debe terminar con una cita entre corchetes con el nombre exacto del archivo, p. ej. [ley_pdf.pdf].
-- No uses comillas ni texto extra dentro de los corchetes. Solo el nombre del archivo.
-- Si una oración se basa en varias fuentes, añade varias citas, p. ej. [ley_pdf.pdf][ley_larga.txt].
-- Si no usas el CONTEXTO en una oración, no añadas cita.
-NO INVENTES artículos, números ni resúmenes.`
-        } as const;
+        `Eres un asistente jurídico. Responde SOLO usando el CONTEXTO.
+        Si algo no está explícitamente en el CONTEXTO, di “No consta en el contexto.”.
+        Estilo: español claro, directo y conciso (máximo 4 oraciones).
+        
+        CITAS (obligatorio si usas CONTEXTO):
+        - Usa exclusivamente archivos del listado de Permitidos.
+        - Cada oración que use datos del CONTEXTO termina con una cita entre corchetes con el nombre exacto del archivo, p. ej. [ley_pdf.pdf].
+        - Si una oración se basa en varias fuentes, añade varias citas sin texto extra: [ley_pdf.pdf][ley_larga.txt].
+        - No cites archivos que no estén en la lista de Permitidos.
+        - Si no usas CONTEXTO en una oración, no añadas cita.
+        
+        Archivos Permitidos: ${allowedFiles.join(", ")}
+        
+        NO INVENTES artículos, números ni resúmenes.`
+        } as const;        
 
         const userMsg = {
           role: "user",
@@ -319,20 +325,112 @@ Responde ahora cumpliendo estrictamente el FORMATO DE SALIDA.`
         });
       } // end stream branch
 
-      // ---------------- NON-STREAM JSON (returns topk) ----------------
-      return new Response(JSON.stringify({
-        ok: true,
-        mode: "rag",
-        receivedCount: msgs.length,
-        lastRole,
-        lastContent,
-        kb,
-        limit,
-        topk: top
-      }), { status: 200, headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      }});
+// ---------------- NON-STREAM: compose answer + return JSON ----------------
+const contextLinesNS: string[] = [];
+for (let i = 0; i < top.length; i++) {
+  const t = top[i];
+  let full = "";
+  try { full = await readKbFileText(t.file); } catch {}
+  let snippet = "";
+  if (full) {
+    const a = Math.max(0, Math.min(full.length, t.start));
+    const b = Math.max(a, Math.min(full.length, t.end));
+    snippet = full.slice(a, b);
+    if (snippet.length > 1200) snippet = snippet.slice(0, 1200) + "…";
+  } else {
+    const ext = t.file.split(".").pop()?.toLowerCase();
+    if (ext === "pdf") {
+      const base = t.file.replace(/\.pdf$/i, "");
+      try {
+        const alt = await readKbFileText(`${base}.txt`);
+        if (alt) {
+          const a = Math.max(0, Math.min(alt.length, t.start));
+          const b = Math.max(a, Math.min(alt.length, t.end));
+          snippet = alt.slice(a, b) || alt.slice(0, 800);
+        }
+      } catch {}
+    }
+    if (!snippet) snippet = `(chunk ${t.id} ${t.start}-${t.end} from ${t.file})`;
+  }
+  contextLinesNS.push(`— file: ${t.file}\n— score: ${t.score}\n— snippet: ${snippet}`);
+}
+const ragContextNS = contextLinesNS.join("\n\n");
+const allowedFilesNS = Array.from(new Set(top.map(t => t.file)));
+
+const systemMsgNS = {
+  role: "system",
+  content:
+`Eres un asistente jurídico. Responde SOLO usando el CONTEXTO.
+Si algo no está explícitamente en el CONTEXTO, di “No consta en el contexto.”.
+Estilo: español claro, directo y conciso (máximo 4 oraciones).
+CITAS (obligatorio si usas CONTEXTO):
+- Usa exclusivamente archivos del listado de Permitidos.
+- Cada oración que use datos del CONTEXTO termina con una cita entre corchetes con el nombre exacto del archivo, p. ej. [ley_pdf.pdf].
+- Si una oración se basa en varias fuentes, añade varias citas sin texto extra: [ley_pdf.pdf][ley_larga.txt].
+- No cites archivos que no estén en la lista de Permitidos.
+- Si no usas CONTEXTO en una oración, no añadas cita.
+Archivos Permitidos: ${allowedFilesNS.join(", ")}
+NO INVENTES artículos, números ni resúmenes.`
+} as const;
+
+const userMsgNS = {
+  role: "user",
+  content:
+`PREGUNTA: ${lastContent}
+
+CONTEXTO:
+${ragContextNS}
+
+FORMATO DE SALIDA (OBLIGATORIO):
+- Entre 1 y 4 oraciones.
+- Citas al final de cada oración basada en el CONTEXTO, con corchetes y sin comillas.
+- Ejemplos:
+  • "El artículo 123 regula los plazos. [ley_pdf.pdf]"
+  • "También prevé excepciones. [ley_larga.txt][ley_pdf.pdf]"
+  • "No consta en el contexto." (si no hay información suficiente)
+Responde ahora cumpliendo estrictamente el FORMATO DE SALIDA.`
+} as const;
+
+let answerText = "No consta en el contexto.";
+if (process.env.OPENAI_API_KEY) {
+  const upstreamNS = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini-2024-07-18",
+      temperature: 0.2,
+      stream: false,
+      messages: [systemMsgNS, userMsgNS],
+    }),
+  });
+  if (upstreamNS.ok) {
+    const data = await upstreamNS.json().catch(() => null);
+    const maybe = data?.choices?.[0]?.message?.content;
+    if (typeof maybe === "string" && maybe.trim().length > 0) {
+      answerText = maybe.trim();
+    }
+  }
+}
+
+return new Response(JSON.stringify({
+  ok: true,
+  mode: "rag",
+  receivedCount: msgs.length,
+  lastRole,
+  lastContent,
+  kb,
+  limit,
+  topk: top,
+  allowedFiles: allowedFilesNS,
+  answer: answerText
+}), { status: 200, headers: {
+  "Content-Type": "application/json",
+  "Access-Control-Allow-Origin": "*",
+}});
+
     }
   } catch {
     // fall through
