@@ -1,5 +1,5 @@
 // app/api/rag/answer/route.ts
-import { roeFinalize, setDisclaimerCookieHeader } from "@/lib/roe/finalizer";
+import { roeFinalize, setDisclaimerCookieHeader } from "../../../../lib/roe/finalizer";
 
 const ROE_FINALIZER_ENABLED = process.env.ROE_FINALIZER_ENABLED === "on";
 const MIN_CONFIDENCE = Number(process.env.MIN_CONFIDENCE ?? 0.55);
